@@ -1,0 +1,30 @@
+[package]
+name = "rtsp-generator"
+version = "0.1.0"
+edition = "2021"
+description = "Detects V4L2 webcams and publishes them as RTSP streams via MediaMTX"
+license = "MIT"
+
+[[bin]]
+name = "rtsp-gen"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+v4l = "0.14"
+if-addrs = "0.13"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+udev = { version = "0.9", features = ["send"] }
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"
