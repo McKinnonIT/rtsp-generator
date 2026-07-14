@@ -134,6 +134,8 @@ async fn build_already_running_report(cli: &Cli, config: &Config, pid: Option<u3
     }
 
     let _ = writeln!(out, "RTSP port:  {}", config.effective_rtsp_port(cli));
+    let _ = writeln!(out, "HLS port:   {}", config.effective_hls_port(cli));
+    let _ = writeln!(out, "WebRTC port: {}", config.effective_webrtc_port(cli));
     if let Some(binary) = &config.mediamtx_binary {
         let _ = writeln!(out, "MediaMTX:   {}", binary.display());
     }
@@ -198,7 +200,11 @@ fn pending_override_note(cli: &Cli, config: &mut Config) -> Option<String> {
     use std::fmt::Write as _;
 
     let device_override_requested = cli.res.is_some() || cli.fps.is_some();
-    let has_any_override = cli.device.is_some() || device_override_requested || cli.port.is_some();
+    let has_any_override = cli.device.is_some()
+        || device_override_requested
+        || cli.port.is_some()
+        || cli.hls_port.is_some()
+        || cli.webrtc_port.is_some();
     if !has_any_override {
         return None;
     }
@@ -208,10 +214,10 @@ fn pending_override_note(cli: &Cli, config: &mut Config) -> Option<String> {
     let Some(device_name) = cli.device.clone() else {
         let _ = writeln!(
             note,
-            "rtsp-generator is already running, so the --res/--fps/--port flags on this \
-             invocation have no effect. To change settings for a running instance, edit {} \
-             directly (rtsp_port for --port, a devices: entry for per-camera --res/--fps) and \
-             run `rtsp-gen --restart`.",
+            "rtsp-generator is already running, so the --res/--fps/--port/--hls-port/\
+             --webrtc-port flags on this invocation have no effect. To change settings for a \
+             running instance, edit {} directly (rtsp_port/hls_port/webrtc_port for those \
+             ports, a devices: entry for per-camera --res/--fps) and run `rtsp-gen --restart`.",
             cli.config.display(),
         );
         return Some(note);
@@ -475,7 +481,7 @@ async fn verify_paths_healthy(api: &MediaMtxApi, cameras: &[Camera]) -> bool {
 async fn verify_and_maybe_downgrade(
     api: &MediaMtxApi,
     cameras: &[Camera],
-    rtsp_port: u16,
+    ports: mediamtx::Ports,
     encoding: &EncodingConfig,
     hw: HwAccel,
     mediamtx_config_path: &Path,
@@ -496,8 +502,7 @@ async fn verify_and_maybe_downgrade(
         backend = hw.label(),
         "hardware encoder produced no usable output against real camera data; falling back to software encoding"
     );
-    let generated =
-        mediamtx::generate_config(cameras, rtsp_port, mediamtx::DEFAULT_API_PORT, encoding, HwAccel::Software);
+    let generated = mediamtx::generate_config(cameras, ports, encoding, HwAccel::Software);
     if let Err(e) = mediamtx::write_config(mediamtx_config_path, &generated) {
         warn!(error = %e, "failed to regenerate MediaMTX config for software fallback");
     }
@@ -533,9 +538,17 @@ pub async fn run(cli: &Cli, mut config: Config) -> anyhow::Result<RunOutcome> {
     let cameras = apply_overrides(cameras, cli, &config)?;
 
     let rtsp_port = config.effective_rtsp_port(cli);
+    let hls_port = config.effective_hls_port(cli);
+    let webrtc_port = config.effective_webrtc_port(cli);
     let binary = mediamtx::find_binary(config.mediamtx_binary.as_deref())?;
     let host_ip = netinfo::detect_lan_ip(config.advertise_ip, &config.exclude_interfaces)?;
     let output_path = resolve_streams_path(cli, &mut config);
+    let ports = mediamtx::Ports {
+        rtsp: rtsp_port,
+        api: mediamtx::DEFAULT_API_PORT,
+        hls: hls_port,
+        webrtc: webrtc_port,
+    };
 
     if cli.dry_run {
         info!(binary = %binary.display(), "[dry-run] would start MediaMTX");
@@ -550,6 +563,8 @@ pub async fn run(cli: &Cli, mut config: Config) -> anyhow::Result<RunOutcome> {
                 resolution = format!("{}x{}", cam.chosen_resolution.0, cam.chosen_resolution.1),
                 fps = cam.fps,
                 rtsp_url = format!("rtsp://{host_ip}:{rtsp_port}/{}", cam.name),
+                hls_url = format!("http://{host_ip}:{hls_port}/{}", cam.name),
+                webrtc_url = format!("http://{host_ip}:{webrtc_port}/{}", cam.name),
                 "[dry-run] would publish"
             );
         }
@@ -560,16 +575,10 @@ pub async fn run(cli: &Cli, mut config: Config) -> anyhow::Result<RunOutcome> {
     let hw = hwaccel::detect(config.encoding.hardware).await;
 
     let mediamtx_config_path = PathBuf::from(mediamtx::CONFIG_PATH);
-    let generated = mediamtx::generate_config(
-        &cameras,
-        rtsp_port,
-        mediamtx::DEFAULT_API_PORT,
-        &config.encoding,
-        hw,
-    );
+    let generated = mediamtx::generate_config(&cameras, ports, &config.encoding, hw);
     mediamtx::write_config(&mediamtx_config_path, &generated)?;
 
-    let streams = output::build(&cameras, host_ip, rtsp_port);
+    let streams = output::build(&cameras, host_ip, rtsp_port, hls_port, webrtc_port);
     output::write_atomic(&output_path, &streams)?;
     info!(path = %output_path.display(), cameras = cameras.len(), "wrote reference YAML");
 
@@ -592,7 +601,7 @@ pub async fn run(cli: &Cli, mut config: Config) -> anyhow::Result<RunOutcome> {
     let mut hw = verify_and_maybe_downgrade(
         &api,
         &cameras,
-        rtsp_port,
+        ports,
         &config.encoding,
         hw,
         &mediamtx_config_path,
@@ -649,8 +658,7 @@ pub async fn run(cli: &Cli, mut config: Config) -> anyhow::Result<RunOutcome> {
                         if needs_full_restart {
                             let generated = mediamtx::generate_config(
                                 &new_cameras,
-                                rtsp_port,
-                                mediamtx::DEFAULT_API_PORT,
+                                ports,
                                 &config.encoding,
                                 hw,
                             );
@@ -664,7 +672,7 @@ pub async fn run(cli: &Cli, mut config: Config) -> anyhow::Result<RunOutcome> {
                             hw = verify_and_maybe_downgrade(
                                 &api,
                                 &new_cameras,
-                                rtsp_port,
+                                ports,
                                 &config.encoding,
                                 hw,
                                 &mediamtx_config_path,
@@ -674,7 +682,7 @@ pub async fn run(cli: &Cli, mut config: Config) -> anyhow::Result<RunOutcome> {
                         }
 
                         known_cameras = new_cameras;
-                        let streams = output::build(&known_cameras, host_ip, rtsp_port);
+                        let streams = output::build(&known_cameras, host_ip, rtsp_port, hls_port, webrtc_port);
                         if let Err(e) = output::write_atomic(&output_path, &streams) {
                             warn!(error = %e, "failed to update reference YAML after hotplug event");
                         } else {
@@ -768,6 +776,8 @@ mod tests {
             device: None,
             fps: None,
             port: None,
+            hls_port: None,
+            webrtc_port: None,
             json: false,
             all: false,
             dry_run: false,

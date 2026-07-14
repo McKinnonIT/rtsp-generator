@@ -70,6 +70,14 @@ pub struct Cli {
     #[arg(short = 'p', long)]
     pub port: Option<u16>,
 
+    /// HLS port for MediaMTX (browser: http://host:PORT/<name>, players: .../index.m3u8).
+    #[arg(long)]
+    pub hls_port: Option<u16>,
+
+    /// WebRTC port for MediaMTX (browser: http://host:PORT/<name>, WHEP: .../whep).
+    #[arg(long)]
+    pub webrtc_port: Option<u16>,
+
     /// Machine-readable output for --list / --status.
     #[arg(long)]
     pub json: bool,
@@ -212,6 +220,8 @@ mod tests {
             device: None,
             fps: None,
             port: None,
+            hls_port: None,
+            webrtc_port: None,
             json: false,
             all: false,
             dry_run: false,

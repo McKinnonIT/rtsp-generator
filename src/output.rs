@@ -14,6 +14,10 @@ pub struct CameraEntry {
     pub resolution: String,
     pub fps: u32,
     pub rtsp_url: String,
+    /// Browser: this URL directly. Players (ffmpeg/VLC): append `/index.m3u8`.
+    pub hls_url: String,
+    /// Browser: this URL directly. WHEP clients: append `/whep`.
+    pub webrtc_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -21,6 +25,8 @@ pub struct StreamsFile {
     pub generated_at: DateTime<Local>,
     pub host_ip: IpAddr,
     pub rtsp_port: u16,
+    pub hls_port: u16,
+    pub webrtc_port: u16,
     pub cameras: Vec<CameraEntry>,
 }
 
@@ -47,7 +53,13 @@ pub enum OutputError {
 }
 
 /// Builds the in-memory reference document for the current camera set. Pure function: no I/O.
-pub fn build(cameras: &[Camera], host_ip: IpAddr, rtsp_port: u16) -> StreamsFile {
+pub fn build(
+    cameras: &[Camera],
+    host_ip: IpAddr,
+    rtsp_port: u16,
+    hls_port: u16,
+    webrtc_port: u16,
+) -> StreamsFile {
     let camera_entries = cameras
         .iter()
         .map(|cam| CameraEntry {
@@ -56,6 +68,8 @@ pub fn build(cameras: &[Camera], host_ip: IpAddr, rtsp_port: u16) -> StreamsFile
             resolution: format!("{}x{}", cam.chosen_resolution.0, cam.chosen_resolution.1),
             fps: cam.fps,
             rtsp_url: format!("rtsp://{host_ip}:{rtsp_port}/{}", cam.name),
+            hls_url: format!("http://{host_ip}:{hls_port}/{}", cam.name),
+            webrtc_url: format!("http://{host_ip}:{webrtc_port}/{}", cam.name),
         })
         .collect();
 
@@ -63,6 +77,8 @@ pub fn build(cameras: &[Camera], host_ip: IpAddr, rtsp_port: u16) -> StreamsFile
         generated_at: Local::now(),
         host_ip,
         rtsp_port,
+        hls_port,
+        webrtc_port,
         cameras: camera_entries,
     }
 }
@@ -138,15 +154,25 @@ mod tests {
     #[test]
     fn builds_expected_entries() {
         let cams = vec![camera("logitech-c920")];
-        let doc = build(&cams, "192.168.1.50".parse().unwrap(), 8554);
+        let doc = build(&cams, "192.168.1.50".parse().unwrap(), 8554, 8888, 8889);
         assert_eq!(doc.host_ip, "192.168.1.50".parse::<IpAddr>().unwrap());
         assert_eq!(doc.rtsp_port, 8554);
+        assert_eq!(doc.hls_port, 8888);
+        assert_eq!(doc.webrtc_port, 8889);
         assert_eq!(doc.cameras.len(), 1);
         assert_eq!(doc.cameras[0].name, "logitech-c920");
         assert_eq!(doc.cameras[0].resolution, "1920x1080");
         assert_eq!(
             doc.cameras[0].rtsp_url,
             "rtsp://192.168.1.50:8554/logitech-c920"
+        );
+        assert_eq!(
+            doc.cameras[0].hls_url,
+            "http://192.168.1.50:8888/logitech-c920"
+        );
+        assert_eq!(
+            doc.cameras[0].webrtc_url,
+            "http://192.168.1.50:8889/logitech-c920"
         );
         assert_eq!(
             doc.cameras[0].device,
@@ -159,7 +185,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("streams.yaml");
         let cams = vec![camera("cam1")];
-        let doc = build(&cams, "10.0.0.5".parse().unwrap(), 8554);
+        let doc = build(&cams, "10.0.0.5".parse().unwrap(), 8554, 8888, 8889);
 
         write_atomic(&path, &doc).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();

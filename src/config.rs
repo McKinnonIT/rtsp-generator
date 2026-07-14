@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{Cli, Resolution};
+use crate::mediamtx::{DEFAULT_HLS_PORT, DEFAULT_WEBRTC_PORT};
 
 /// Per-device resolution/fps override, keyed by stable camera name in `devices:`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,6 +71,13 @@ impl Default for EncodingConfig {
 #[serde(default)]
 pub struct Config {
     pub rtsp_port: u16,
+    /// HLS port MediaMTX listens on. Every published camera is automatically viewable over HLS
+    /// (browser: `http://<host>:<port>/<name>`, players: `.../index.m3u8`) — MediaMTX serves
+    /// every path over every enabled protocol, no separate ffmpeg command needed.
+    pub hls_port: u16,
+    /// WebRTC port MediaMTX listens on (browser: `http://<host>:<port>/<name>`, WHEP:
+    /// `.../whep`). See `hls_port` doc comment — same automatic per-path behavior applies.
+    pub webrtc_port: u16,
     pub mediamtx_binary: Option<PathBuf>,
     pub advertise_ip: Option<IpAddr>,
     pub exclude_interfaces: Vec<String>,
@@ -85,6 +93,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             rtsp_port: 8554,
+            hls_port: DEFAULT_HLS_PORT,
+            webrtc_port: DEFAULT_WEBRTC_PORT,
             mediamtx_binary: None,
             advertise_ip: None,
             exclude_interfaces: vec![
@@ -163,6 +173,17 @@ impl Config {
         cli.port.unwrap_or(self.rtsp_port)
     }
 
+    /// Resolves the effective HLS port: `--hls-port` CLI flag wins, else `hls_port` from config.
+    pub fn effective_hls_port(&self, cli: &Cli) -> u16 {
+        cli.hls_port.unwrap_or(self.hls_port)
+    }
+
+    /// Resolves the effective WebRTC port: `--webrtc-port` CLI flag wins, else `webrtc_port` from
+    /// config.
+    pub fn effective_webrtc_port(&self, cli: &Cli) -> u16 {
+        cli.webrtc_port.unwrap_or(self.webrtc_port)
+    }
+
     /// Resolves the effective resolution/fps for a given camera, applying the precedence
     /// described in the spec:
     ///   1. `--device <name> --res/--fps` (CLI, scoped to that device) — highest priority
@@ -227,6 +248,8 @@ mod tests {
             device: device.map(String::from),
             fps,
             port: None,
+            hls_port: None,
+            webrtc_port: None,
             json: false,
             all: false,
             dry_run: false,

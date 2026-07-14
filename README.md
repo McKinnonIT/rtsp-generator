@@ -3,9 +3,15 @@
 Detects V4L2 webcams attached to a Linux host and publishes each one as an RTSP stream via
 [MediaMTX](https://github.com/bluenviron/mediamtx), supervising MediaMTX as a child process and
 reacting live to USB hotplug/unplug. Also writes a `streams.yaml` reference file so other systems
-on the LAN can discover each camera's RTSP URL.
+on the LAN can discover each camera's RTSP/HLS/WebRTC URLs.
 
-Binary name: `rtsp-gen`. LAN-only trust model — no auth/TLS on the RTSP streams.
+Binary name: `rtsp-gen`. LAN-only trust model — no auth/TLS on any of the RTSP/HLS/WebRTC streams.
+
+**HLS and WebRTC**: every published camera is automatically also viewable over HLS and WebRTC —
+MediaMTX serves every path it knows about (`paths:` in the generated config) over every protocol
+it has enabled, so there's no separate ffmpeg command or extra encoding step involved, regardless
+of which one a camera needs for RTSP (passthrough or transcode). See "Viewing a stream" below for
+URLs.
 
 **Encoding**: cameras that natively capture H.264 are passed through untouched (`-c copy`).
 Everything else — MJPEG (the common case for most UVC webcams), raw YUYV/NV12, etc. — is
@@ -117,6 +123,37 @@ Two identical camera models get different animals because they have different se
 rare case two cameras somehow hash to the same animal, the existing USB-port-based (or numeric)
 disambiguation still applies on top.
 
+**Cheap/generic cameras with no real serial**: some no-name UVC modules hardcode the exact same
+USB serial across every unit of the same model (seen firsthand: several physically distinct
+cameras all reporting `ID_SERIAL=HHWei_Technology_Co.__Ltd._W4LS_HHW001`). When that happens, udev
+can't create a `/dev/v4l/by-id/` symlink for most of them at all, so there's no real per-unit
+identifier to hash — without a fallback, every such unit would get the *same* animal name and only
+be told apart by a numeric/port suffix bolted on afterward (e.g. `w4ls-w4ls-echidna-1-4-1-0`). To
+avoid that, when no by-id symlink is found, the camera's USB port path is folded into the hash
+instead, so each currently-connected port still gets its own distinct, memorable animal. The
+trade-off: unlike serial-based naming, this name changes if the camera is moved to a different USB
+port — there's no better identifier available for hardware that doesn't expose a real serial.
+
+## Viewing a stream
+
+Every camera is published over three protocols simultaneously, all serving the same underlying
+capture — pick whichever suits the client:
+
+| Protocol | Browser (built-in player)         | Non-browser client                          |
+|----------|------------------------------------|----------------------------------------------|
+| RTSP     | —                                   | `rtsp://<host>:8554/<name>` (ffplay, VLC)     |
+| HLS      | `http://<host>:8888/<name>`         | `http://<host>:8888/<name>/index.m3u8`        |
+| WebRTC   | `http://<host>:8889/<name>`         | `http://<host>:8889/<name>/whep` (WHEP)       |
+
+RTSP has the lowest latency and is the best fit for other software (NVRs, computer vision
+pipelines); HLS is the most compatible with restrictive networks/proxies but adds a few seconds of
+latency; WebRTC is the best balance for a human watching live in a browser. All three URLs (plus
+`rtsp_port`/`hls_port`/`webrtc_port`) are written to `streams.yaml` per camera, and shown by
+`rtsp-gen --list`.
+
+Ports default to MediaMTX's own defaults (`8554`/`8888`/`8889`) and are configurable — see
+`config.yaml` below.
+
 ## CLI
 
 ```
@@ -124,8 +161,9 @@ rtsp-gen                      # full run: detect, generate config, start MediaMT
                                # streams.yaml, then block watching for hotplug events
                                # (this is what systemd runs)
 rtsp-gen --list [--all] [--json]  # detect and print webcams; no side effects. Default: name,
-                                   # current resolution/fps, RTSP URL. --all additionally shows
-                                   # device path and every supported resolution.
+                                   # current resolution/fps, RTSP/HLS/WebRTC URLs. --all
+                                   # additionally shows device path and every supported
+                                   # resolution.
 rtsp-gen --status [--json]    # systemctl status; --json additionally queries the MediaMTX
                                # control API for per-path health
 rtsp-gen --info [--json]      # per-camera active encoder (hardware backend or software) and
@@ -144,6 +182,8 @@ rtsp-gen --about              # version / target / license / repo
   -d, --device <name>     scope --res/--fps to one camera by its stable name
       --fps <n>           override framerate
   -p, --port <n>          RTSP port (default 8554)
+      --hls-port <n>      HLS port (default 8888)
+      --webrtc-port <n>   WebRTC port (default 8889)
       --json              machine-readable output for --list / --status / --info
       --all               with --list, show full device capabilities instead of just
                            the current setting
@@ -173,9 +213,9 @@ reports that and exits with code `1`.
 
 ### Changing settings while it's already running
 
-`--res`/`--fps`/`--device`/`--port` only ever apply to the foreground run they're attached to —
-but that run refuses to start while another instance holds the lock, so those flags would
-otherwise be silently ignored with no indication anything was wrong. Instead:
+`--res`/`--fps`/`--device`/`--port`/`--hls-port`/`--webrtc-port` only ever apply to the foreground
+run they're attached to — but that run refuses to start while another instance holds the lock, so
+those flags would otherwise be silently ignored with no indication anything was wrong. Instead:
 
 - `--device <name>` with `--res`/`--fps`: the override is saved into `config.yaml`'s `devices:`
   section for you, and the report tells you to run `rtsp-gen --restart` to apply it.
@@ -190,9 +230,9 @@ otherwise be silently ignored with no indication anything was wrong. Instead:
       fps: 10
   Run `rtsp-gen --restart` to apply it.
   ```
-- `--res`/`--fps`/`--port` **without** `--device` (a global override): there's no well-defined
-  place to persist a global override automatically, so it just explains that and tells you to
-  edit `config.yaml` directly and restart.
+- `--res`/`--fps`/`--port`/`--hls-port`/`--webrtc-port` **without** `--device` (a global override):
+  there's no well-defined place to persist a global override automatically, so it just explains
+  that and tells you to edit `config.yaml` directly and restart.
 - `--dry-run` previews what would be saved without writing anything, same as everywhere else.
 
 ## Where streams.yaml is stored
@@ -216,6 +256,8 @@ Resolved in this order, on every default (no-flag) run:
 
 ```yaml
 rtsp_port: 8554
+hls_port: 8888                # MediaMTX's own default; every camera is auto-served here too
+webrtc_port: 8889              # same — see "Viewing a stream" above
 mediamtx_binary: /usr/local/bin/mediamtx
 advertise_ip: null            # null = auto-detect
 exclude_interfaces: ["docker0", "br-", "veth", "tailscale0", "zt"]
@@ -343,7 +385,9 @@ Integration testing against real webcams is out of scope for CI. To test by hand
      per camera.
    - `streams.yaml` is written at `/etc/rtsp-generator/streams.yaml` (or `--output` path) with the
      correct LAN IP and one `rtsp_url` per camera.
-   - Each stream is playable from another host on the LAN: `ffplay rtsp://<host-ip>:8554/<name>`.
+   - Each stream is playable from another host on the LAN: `ffplay rtsp://<host-ip>:8554/<name>`,
+     and viewable in a browser at `http://<host-ip>:8888/<name>` (HLS) and
+     `http://<host-ip>:8889/<name>` (WebRTC).
 3. **Hotplug**: with the daemon running, unplug a webcam and confirm its entry disappears from
    `streams.yaml` and its MediaMTX path stops within a few seconds; replug it and confirm it
    reappears with a working stream, without interrupting other cameras' streams.

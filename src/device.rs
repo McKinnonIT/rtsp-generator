@@ -372,25 +372,58 @@ fn split_vendor_model_serial(name: &str) -> (String, String) {
     (model, name.to_string())
 }
 
+/// Pure derivation logic behind `derive_name`; split out so it's unit-testable without real
+/// udev/USB hardware. `has_stable_path` is `true` when a `/dev/v4l/by-id/` symlink was found for
+/// this device — see the USB-port note below for why that (not just which raw name was used)
+/// matters.
+fn derive_name_from(raw_name: &str, has_stable_path: bool, usb_port: Option<&str>) -> String {
+    let (model, mut seed) = split_vendor_model_serial(raw_name);
+
+    // No by-id symlink means udev couldn't tell this device apart from another currently (or
+    // previously) attached device reporting the same serial — this happens in practice with
+    // cheap/generic UVC modules that hardcode an identical serial across every unit of the same
+    // model (seen firsthand: several physically distinct cameras all reporting
+    // `ID_SERIAL=HHWei_Technology_Co.__Ltd._W4LS_HHW001`). Folding the USB port path into the
+    // seed at least gives each currently-connected port a distinct, stable-per-port animal name,
+    // instead of every such unit colliding on the same one and relying on a bolted-on numeric/
+    // port suffix (`disambiguate`) to tell them apart. Trade-off: unlike the by-id case, this
+    // name changes if the camera is moved to a different port — unavoidable without a real
+    // per-unit serial to key off instead.
+    if !has_stable_path {
+        if let Some(port) = usb_port {
+            seed = format!("{seed}#{port}");
+        }
+    }
+
+    format!("{}-{}", slugify(&model), animal_suffix(&seed))
+}
+
 /// Derives the stable, human-friendly name for a camera: by-id symlink, else `ID_V4L_PRODUCT`,
 /// else `videoN`, with the USB vendor ID and serial number stripped from the visible part and
 /// replaced with a deterministic animal name (e.g. `hd-pro-webcam-c920-badger`) — memorable, and
-/// still unique per physical device since it's derived from that device's actual serial.
+/// still unique per physical device since it's derived from that device's actual serial (or, for
+/// hardware that doesn't expose one, its USB port — see `derive_name_from`).
 fn derive_name(devnode: &Path, stable_path: Option<&Path>) -> String {
-    let raw_name = stable_path
+    let stable_name = stable_path
         .and_then(|stable| stable.file_name())
-        .map(|n| strip_by_id_decoration(&n.to_string_lossy()).to_string())
-        .or_else(|| udev_product_name(devnode))
-        .unwrap_or_else(|| {
-            devnode
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        });
+        .map(|n| strip_by_id_decoration(&n.to_string_lossy()).to_string());
 
-    let (model, seed) = split_vendor_model_serial(&raw_name);
-    format!("{}-{}", slugify(&model), animal_suffix(&seed))
+    let raw_name = stable_name.clone().or_else(|| udev_product_name(devnode)).unwrap_or_else(|| {
+        devnode
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    });
+
+    let has_stable_path = stable_name.is_some();
+    let usb_port = if has_stable_path {
+        None
+    } else {
+        usb_port_suffix(devnode)
+    };
+
+    derive_name_from(&raw_name, has_stable_path, usb_port.as_deref())
 }
 
 /// Returns a short suffix derived from the device's USB port path (e.g. "1-1.2"),
@@ -613,5 +646,38 @@ mod tests {
         let first = derive_name(Path::new("/dev/video0"), Some(&stable_path));
         let second = derive_name(Path::new("/dev/video3"), Some(&stable_path));
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn no_by_id_symlink_folds_usb_port_into_the_seed() {
+        // Regression test for real hardware: several physically distinct cheap UVC modules that
+        // all report the exact same generic `ID_V4L_PRODUCT=W4LS: W4LS` (and the same hardcoded
+        // `ID_SERIAL`), so udev never creates a `/dev/v4l/by-id/` symlink for most of them. Without
+        // folding in the USB port, every one of these would hash to the same animal and only be
+        // told apart by a numeric/port suffix bolted on afterward — defeating the point of a
+        // memorable per-camera name. With the port folded into the seed, distinct ports get
+        // distinct animals directly.
+        let a = derive_name_from("W4LS: W4LS", false, Some("1-5.1"));
+        let b = derive_name_from("W4LS: W4LS", false, Some("1-4"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn by_id_symlink_present_ignores_usb_port() {
+        // A real by-id symlink means udev already told this device apart from every other
+        // currently-attached one via its serial, which is stable across ports — so the USB port
+        // must NOT affect the name here, unlike the no-symlink fallback above.
+        let with_port = derive_name_from("046d_HD_Pro_Webcam_C920_7438C0DF", true, Some("1-5.1"));
+        let without_port = derive_name_from("046d_HD_Pro_Webcam_C920_7438C0DF", true, None);
+        assert_eq!(with_port, without_port);
+    }
+
+    #[test]
+    fn no_by_id_symlink_and_no_usb_port_falls_back_to_the_bare_seed() {
+        // No symlink and no USB parent found either (e.g. a non-USB capture device): behaves
+        // like before this fix, since there's nothing extra to fold in.
+        let a = derive_name_from("W4LS: W4LS", false, None);
+        let b = derive_name_from("W4LS: W4LS", false, None);
+        assert_eq!(a, b);
     }
 }

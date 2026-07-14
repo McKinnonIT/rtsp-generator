@@ -14,6 +14,11 @@ use crate::device::Camera;
 use crate::hwaccel::{HwAccel, VAAPI_DEVICE};
 
 pub const DEFAULT_API_PORT: u16 = 9997;
+/// MediaMTX's own built-in default; kept explicit in the generated config (rather than relying
+/// on that implicit default) so behavior doesn't silently change on a MediaMTX upgrade.
+pub const DEFAULT_HLS_PORT: u16 = 8888;
+/// MediaMTX's own built-in default; see `DEFAULT_HLS_PORT`.
+pub const DEFAULT_WEBRTC_PORT: u16 = 8889;
 /// Working config path, separate from any user-authored MediaMTX config so regeneration never
 /// clobbers a hand-edited file.
 pub const CONFIG_PATH: &str = "/var/lib/rtsp-generator/mediamtx.yml";
@@ -79,6 +84,18 @@ pub struct GeneratedConfig {
     pub api: bool,
     #[serde(rename = "apiAddress")]
     pub api_address: String,
+    /// Enables MediaMTX's built-in HLS server. Every path defined below is automatically served
+    /// over HLS with no separate ffmpeg command — MediaMTX transmuxes from whatever's already
+    /// being published. Browser: `http://<host>:<hls_port>/<name>`; players (ffmpeg/VLC):
+    /// `.../index.m3u8`.
+    pub hls: bool,
+    #[serde(rename = "hlsAddress")]
+    pub hls_address: String,
+    /// Enables MediaMTX's built-in WebRTC server; same automatic per-path behavior as `hls`.
+    /// Browser: `http://<host>:<webrtc_port>/<name>`; WHEP clients: `.../whep`.
+    pub webrtc: bool,
+    #[serde(rename = "webrtcAddress")]
+    pub webrtc_address: String,
     pub paths: BTreeMap<String, PathConfig>,
 }
 
@@ -191,24 +208,37 @@ fn path_config(camera: &Camera, rtsp_port: u16, encoding: &EncodingConfig, hw: H
     }
 }
 
+/// The set of ports MediaMTX listens on, bundled to keep `generate_config` and its callers from
+/// accumulating a long run of individual `u16` parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct Ports {
+    pub rtsp: u16,
+    pub api: u16,
+    pub hls: u16,
+    pub webrtc: u16,
+}
+
 /// Generates the full MediaMTX config for the given camera set. Pure function: given a
 /// `Vec<Camera>`, produces a struct that serializes deterministically to YAML.
 pub fn generate_config(
     cameras: &[Camera],
-    rtsp_port: u16,
-    api_port: u16,
+    ports: Ports,
     encoding: &EncodingConfig,
     hw: HwAccel,
 ) -> GeneratedConfig {
     let paths = cameras
         .iter()
-        .map(|cam| (cam.name.clone(), path_config(cam, rtsp_port, encoding, hw)))
+        .map(|cam| (cam.name.clone(), path_config(cam, ports.rtsp, encoding, hw)))
         .collect();
 
     GeneratedConfig {
-        rtsp_address: format!(":{rtsp_port}"),
+        rtsp_address: format!(":{}", ports.rtsp),
         api: true,
-        api_address: format!(":{api_port}"),
+        api_address: format!(":{}", ports.api),
+        hls: true,
+        hls_address: format!(":{}", ports.hls),
+        webrtc: true,
+        webrtc_address: format!(":{}", ports.webrtc),
         paths,
     }
 }
@@ -498,13 +528,26 @@ mod tests {
         }
     }
 
+    fn test_ports() -> Ports {
+        Ports {
+            rtsp: 8554,
+            api: 9997,
+            hls: 8888,
+            webrtc: 8889,
+        }
+    }
+
     #[test]
     fn generates_expected_path_entry() {
         let cams = vec![camera("logitech-c920")];
-        let config = generate_config(&cams, 8554, 9997, &EncodingConfig::default(), HwAccel::Software);
+        let config = generate_config(&cams, test_ports(), &EncodingConfig::default(), HwAccel::Software);
         assert_eq!(config.rtsp_address, ":8554");
         assert_eq!(config.api_address, ":9997");
         assert!(config.api);
+        assert!(config.hls);
+        assert_eq!(config.hls_address, ":8888");
+        assert!(config.webrtc);
+        assert_eq!(config.webrtc_address, ":8889");
 
         let path = config.paths.get("logitech-c920").unwrap();
         assert!(path.run_on_init_restart);
@@ -725,7 +768,7 @@ mod tests {
     #[test]
     fn multiple_cameras_get_distinct_paths() {
         let cams = vec![camera("cam1"), camera("cam2")];
-        let config = generate_config(&cams, 8554, 9997, &EncodingConfig::default(), HwAccel::Software);
+        let config = generate_config(&cams, test_ports(), &EncodingConfig::default(), HwAccel::Software);
         assert_eq!(config.paths.len(), 2);
         assert!(config.paths.contains_key("cam1"));
         assert!(config.paths.contains_key("cam2"));
@@ -734,10 +777,34 @@ mod tests {
     #[test]
     fn yaml_round_trips() {
         let cams = vec![camera("cam1")];
-        let config = generate_config(&cams, 8554, 9997, &EncodingConfig::default(), HwAccel::Software);
+        let config = generate_config(&cams, test_ports(), &EncodingConfig::default(), HwAccel::Software);
         let yaml = to_yaml(&config);
         let parsed: GeneratedConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn yaml_uses_the_exact_keys_mediamtx_expects_for_hls_and_webrtc() {
+        // Regression guard: these key names (camelCase, not the struct's snake_case field names)
+        // come from MediaMTX's own config schema. A typo here wouldn't fail to parse — MediaMTX
+        // would just silently fall back to its own defaults for the misspelled key.
+        let cams = vec![camera("cam1")];
+        let config = generate_config(
+            &cams,
+            Ports {
+                rtsp: 8554,
+                api: 9997,
+                hls: DEFAULT_HLS_PORT,
+                webrtc: DEFAULT_WEBRTC_PORT,
+            },
+            &EncodingConfig::default(),
+            HwAccel::Software,
+        );
+        let yaml = to_yaml(&config);
+        assert!(yaml.contains("hls: true"));
+        assert!(yaml.contains(&format!("hlsAddress: :{DEFAULT_HLS_PORT}")));
+        assert!(yaml.contains("webrtc: true"));
+        assert!(yaml.contains(&format!("webrtcAddress: :{DEFAULT_WEBRTC_PORT}")));
     }
 
     #[test]

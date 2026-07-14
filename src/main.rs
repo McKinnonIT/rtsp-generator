@@ -92,6 +92,8 @@ struct CameraSummary {
     fps: u32,
     pixel_format: String,
     rtsp_url: String,
+    hls_url: String,
+    webrtc_url: String,
 }
 
 fn run_list(cli: &Cli) -> i32 {
@@ -129,6 +131,8 @@ fn run_list(cli: &Cli) -> i32 {
     };
 
     let rtsp_port = config.effective_rtsp_port(cli);
+    let hls_port = config.effective_hls_port(cli);
+    let webrtc_port = config.effective_webrtc_port(cli);
     let host_ip = match netinfo::detect_lan_ip(config.advertise_ip, &config.exclude_interfaces) {
         Ok(ip) => Some(ip),
         Err(e) => {
@@ -136,23 +140,38 @@ fn run_list(cli: &Cli) -> i32 {
             None
         }
     };
-    let rtsp_url = |name: &str| match host_ip {
-        Some(ip) => format!("rtsp://{ip}:{rtsp_port}/{name}"),
-        None => format!("rtsp://<unknown-host>:{rtsp_port}/{name}"),
+    let stream_urls = |name: &str| {
+        let host = match host_ip {
+            Some(ip) => ip.to_string(),
+            None => "<unknown-host>".to_string(),
+        };
+        StreamUrls {
+            rtsp: format!("rtsp://{host}:{rtsp_port}/{name}"),
+            hls: format!("http://{host}:{hls_port}/{name}"),
+            webrtc: format!("http://{host}:{webrtc_port}/{name}"),
+        }
     };
 
     if cli.json {
         let result = if cli.all {
-            serde_json::to_string_pretty(&camera_all_json(&cameras, rtsp_url))
+            serde_json::to_string_pretty(&camera_all_json(&cameras, stream_urls))
         } else {
             let summaries: Vec<CameraSummary> = cameras
                 .iter()
-                .map(|cam| CameraSummary {
-                    name: cam.name.clone(),
-                    resolution: format!("{}x{}", cam.chosen_resolution.0, cam.chosen_resolution.1),
-                    fps: cam.fps,
-                    pixel_format: cam.pixel_format.clone(),
-                    rtsp_url: rtsp_url(&cam.name),
+                .map(|cam| {
+                    let urls = stream_urls(&cam.name);
+                    CameraSummary {
+                        name: cam.name.clone(),
+                        resolution: format!(
+                            "{}x{}",
+                            cam.chosen_resolution.0, cam.chosen_resolution.1
+                        ),
+                        fps: cam.fps,
+                        pixel_format: cam.pixel_format.clone(),
+                        rtsp_url: urls.rtsp,
+                        hls_url: urls.hls,
+                        webrtc_url: urls.webrtc,
+                    }
                 })
                 .collect();
             serde_json::to_string_pretty(&summaries)
@@ -165,28 +184,38 @@ fn run_list(cli: &Cli) -> i32 {
             }
         }
     } else if cli.all {
-        print_camera_table_all(&cameras, rtsp_url);
+        print_camera_table_all(&cameras, stream_urls);
     } else {
-        print_camera_table(&cameras, rtsp_url);
+        print_camera_table(&cameras, stream_urls);
     }
 
     EXIT_OK
 }
 
-/// Full `Camera` fields (device path, all supported resolutions, ...) plus `rtsp_url`, for
+/// RTSP/HLS/WebRTC URLs for one camera, all rooted at the same host.
+struct StreamUrls {
+    rtsp: String,
+    hls: String,
+    webrtc: String,
+}
+
+/// Full `Camera` fields (device path, all supported resolutions, ...) plus stream URLs, for
 /// `--list --all --json`.
 fn camera_all_json(
     cameras: &[device::Camera],
-    rtsp_url: impl Fn(&str) -> String,
+    stream_urls: impl Fn(&str) -> StreamUrls,
 ) -> serde_json::Value {
     let entries: Vec<serde_json::Value> = cameras
         .iter()
         .map(|cam| {
             let mut value = serde_json::to_value(cam).unwrap_or(serde_json::Value::Null);
             if let Some(obj) = value.as_object_mut() {
+                let urls = stream_urls(&cam.name);
+                obj.insert("rtsp_url".to_string(), serde_json::Value::String(urls.rtsp));
+                obj.insert("hls_url".to_string(), serde_json::Value::String(urls.hls));
                 obj.insert(
-                    "rtsp_url".to_string(),
-                    serde_json::Value::String(rtsp_url(&cam.name)),
+                    "webrtc_url".to_string(),
+                    serde_json::Value::String(urls.webrtc),
                 );
             }
             value
@@ -195,33 +224,45 @@ fn camera_all_json(
     serde_json::Value::Array(entries)
 }
 
-/// Concise table: name, current setting, RTSP URL. This is the default `--list` view.
-fn print_camera_table(cameras: &[device::Camera], rtsp_url: impl Fn(&str) -> String) {
-    println!("{:<35} {:<22} RTSP URL", "NAME", "SETTING");
-    for cam in cameras {
+/// Prints the `rtsp:`/`hls:`/`webrtc:` block shared by both table views. Indented lines rather
+/// than fixed-width columns, since long camera names and long URLs together blow past any
+/// column width worth picking — a table layout just misaligns instead of wrapping.
+fn print_url_block(urls: &StreamUrls) {
+    println!("    rtsp:   {}", urls.rtsp);
+    println!("    hls:    {}", urls.hls);
+    println!("    webrtc: {}", urls.webrtc);
+}
+
+/// Concise view: name, current setting, then an indented URL block. This is the default
+/// `--list` view.
+fn print_camera_table(cameras: &[device::Camera], stream_urls: impl Fn(&str) -> StreamUrls) {
+    for (i, cam) in cameras.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
         let setting = format!(
             "{}x{}@{}fps ({})",
             cam.chosen_resolution.0, cam.chosen_resolution.1, cam.fps, cam.pixel_format
         );
-        println!("{:<35} {:<22} {}", cam.name, setting, rtsp_url(&cam.name));
+        println!("{} - {setting}", cam.name);
+        print_url_block(&stream_urls(&cam.name));
     }
 }
 
-/// Full table: adds device path and every supported resolution. Shown with `--list --all`.
-fn print_camera_table_all(cameras: &[device::Camera], rtsp_url: impl Fn(&str) -> String) {
-    println!(
-        "{:<35} {:<45} {:<12} {:<5} {:<7} RTSP URL",
-        "NAME", "DEVICE", "RESOLUTION", "FPS", "FORMAT"
-    );
-    for cam in cameras {
+/// Full view: adds device path and every supported resolution. Shown with `--list --all`.
+fn print_camera_table_all(cameras: &[device::Camera], stream_urls: impl Fn(&str) -> StreamUrls) {
+    for (i, cam) in cameras.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
         println!(
-            "{:<35} {:<45} {:<12} {:<5} {:<7} {}",
+            "{} - {} - {}x{}@{}fps ({})",
             cam.name,
             cam.device_path.display(),
-            format!("{}x{}", cam.chosen_resolution.0, cam.chosen_resolution.1),
+            cam.chosen_resolution.0,
+            cam.chosen_resolution.1,
             cam.fps,
             cam.pixel_format,
-            rtsp_url(&cam.name),
         );
         let res_list = cam
             .resolutions
@@ -229,7 +270,8 @@ fn print_camera_table_all(cameras: &[device::Camera], rtsp_url: impl Fn(&str) ->
             .map(|(w, h)| format!("{w}x{h}"))
             .collect::<Vec<_>>()
             .join(", ");
-        println!("{:<35} resolutions available: {res_list}", "");
+        println!("    resolutions available: {res_list}");
+        print_url_block(&stream_urls(&cam.name));
     }
 }
 
